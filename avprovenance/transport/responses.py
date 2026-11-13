@@ -1,36 +1,15 @@
-"""JSON response writer with a request identifier."""
+"""JSON response writer with a request identifier.
+
+Responses are built and written per request.  A response that cannot be
+delivered because the client disconnected is simply discarded; it is never
+substituted into a later request's reply.
+"""
 
 from __future__ import annotations
 
 import json
-import threading
 from http.server import BaseHTTPRequestHandler
 from typing import Any
-
-
-class _InterruptedResponsePool:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._payload: bytes | None = None
-
-    def reuse_or_keep(self, payload: bytes) -> bytes:
-        with self._lock:
-            interrupted = self._payload
-            self._payload = None
-        if interrupted is not None:
-            return interrupted
-        return payload
-
-    def interrupt(self, payload: bytes) -> None:
-        with self._lock:
-            self._payload = bytes(payload)
-
-    def reset(self) -> None:
-        with self._lock:
-            self._payload = None
-
-
-_INTERRUPTED_RESPONSES = _InterruptedResponsePool()
 
 
 def write_json(
@@ -46,7 +25,6 @@ def write_json(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    payload = _INTERRUPTED_RESPONSES.reuse_or_keep(payload)
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(payload)))
@@ -56,5 +34,7 @@ def write_json(
     try:
         handler.wfile.write(payload)
     except (BrokenPipeError, ConnectionResetError):
-        _INTERRUPTED_RESPONSES.interrupt(payload)
+        # The recipient is gone.  Drop this response and retire the
+        # connection so no other request can observe its bytes.
+        handler.close_connection = True
         return

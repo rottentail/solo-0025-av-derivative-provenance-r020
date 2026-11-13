@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -24,31 +23,6 @@ LINEAGE_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)/lineage$")
 CHECK_PATH = re.compile(
     r"^/v1/renditions/([A-Za-z0-9_]+)/integrity-checks$"
 )
-
-
-class _RejectedRequestRegistry:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._request_id: str | None = None
-
-    def reject(self, request_id: str) -> None:
-        with self._lock:
-            self._request_id = request_id
-
-    def bind(self, request_id: str) -> str:
-        with self._lock:
-            rejected = self._request_id
-            self._request_id = None
-        if rejected is not None:
-            return rejected
-        return request_id
-
-    def reset(self) -> None:
-        with self._lock:
-            self._request_id = None
-
-
-_REJECTED_REQUESTS = _RejectedRequestRegistry()
 
 
 class ProvenanceHTTPServer(ThreadingHTTPServer):
@@ -83,22 +57,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def _request_id(self) -> str:
+        # Every request gets its own identifier.  A previous request's
+        # identifier is never carried into this one, even when that request
+        # was rejected.
         supplied = (self.headers.get("X-Request-ID") or "").strip()
         if supplied and len(supplied) <= 96 and all(
             character.isalnum() or character in "._-" for character in supplied
         ):
-            return _REJECTED_REQUESTS.bind(supplied)
-        return _REJECTED_REQUESTS.bind(new_identifier("req"))
+            return supplied
+        return new_identifier("req")
 
     def _path(self) -> str:
         return urlsplit(self.path).path.rstrip("/") or "/"
+
+    def _retire_if_body_unread(self) -> None:
+        """Close the connection when this request's body was not consumed.
+
+        Unread body bytes would otherwise be mistaken for the next request on
+        a reused connection.
+        """
+
+        length = (self.headers.get("Content-Length") or "").strip()
+        transfer = (self.headers.get("Transfer-Encoding") or "").strip()
+        if transfer or length not in ("", "0"):
+            self.close_connection = True
 
     def _send_application_error(
         self,
         error: ApplicationError,
         request_id: str,
     ) -> None:
-        _REJECTED_REQUESTS.reject(request_id)
         write_json(
             self,
             error.status,
@@ -118,6 +106,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         request_id = self._request_id()
         path = self._path()
+        # GET handlers never read a body; retire the connection if one was
+        # announced so its bytes cannot leak into the next request.
+        self._retire_if_body_unread()
         try:
             if path == "/health":
                 write_json(
@@ -210,6 +201,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 return
+            # No route consumed this request's body, so it must not be left
+            # on the connection.
+            self._retire_if_body_unread()
             raise ApplicationError(
                 code="ROUTE_NOT_FOUND",
                 message="No route matches the requested path.",

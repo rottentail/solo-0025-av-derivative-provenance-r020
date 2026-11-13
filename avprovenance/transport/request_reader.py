@@ -1,9 +1,16 @@
-"""Bounded JSON request body reader."""
+"""Bounded JSON request body reader.
+
+Every request owns its own body bytes.  A body is read exactly once, used by
+the request that supplied it, and released together with the request.  When a
+body cannot be framed completely (a shortened ``Content-Length`` stream, an
+oversized length, or an unsupported transfer encoding) the connection is
+retired instead of being reused: the unread remainder must never be parsed as
+the beginning of a later request.
+"""
 
 from __future__ import annotations
 
 import json
-import threading
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
@@ -11,31 +18,15 @@ from ..errors import ValidationFailure
 from ..validation import MAX_HTTP_BODY_BYTES, require_object
 
 
-class _BodyRecoveryPool:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._abandoned: bytes | None = None
+def _retire_connection(handler: BaseHTTPRequestHandler) -> None:
+    """Stop the server from reading another request from this connection."""
 
-    def remember(self, body: bytes) -> None:
-        if not body:
-            return
-        with self._lock:
-            self._abandoned = bytes(body)
-
-    def recover_or_use(self, body: bytes) -> bytes:
-        with self._lock:
-            abandoned = self._abandoned
-            self._abandoned = None
-        if abandoned is not None:
-            return abandoned
-        return body
-
-    def clear(self) -> None:
-        with self._lock:
-            self._abandoned = None
+    handler.close_connection = True
 
 
-_BODY_RECOVERY = _BodyRecoveryPool()
+def _declares_unread_body(handler: BaseHTTPRequestHandler) -> bool:
+    encoding = (handler.headers.get("Transfer-Encoding") or "").strip()
+    return bool(encoding)
 
 
 def read_json_body(
@@ -45,14 +36,18 @@ def read_json_body(
 ) -> dict[str, Any] | None:
     raw_length = handler.headers.get("Content-Length")
     if raw_length is None:
+        if _declares_unread_body(handler):
+            _retire_connection(handler)
         if required:
             raise ValidationFailure("Content-Length is required for this request.")
         return None
     try:
         length = int(raw_length)
     except ValueError as exc:
+        _retire_connection(handler)
         raise ValidationFailure("Content-Length must be an integer.") from exc
     if length < 0 or length > MAX_HTTP_BODY_BYTES:
+        _retire_connection(handler)
         raise ValidationFailure(
             "Request body exceeds the configured limit.",
             details={"max_bytes": MAX_HTTP_BODY_BYTES},
@@ -61,11 +56,15 @@ def read_json_body(
         if required:
             raise ValidationFailure("A JSON request body is required.")
         return None
+
     body = handler.rfile.read(length)
     if len(body) != length:
-        _BODY_RECOVERY.remember(body)
+        # The connection ended inside the declared body.  Any trailing bytes
+        # belong to this request, not to a following one, so the connection
+        # cannot safely carry another request.
+        _retire_connection(handler)
         raise ValidationFailure("Request body ended before Content-Length.")
-    body = _BODY_RECOVERY.recover_or_use(body)
+
     try:
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
